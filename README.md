@@ -4,3 +4,5 @@ to learn Zig. The project also contains an echo benchmark where messages are bei
 echoed between a client and server. To run the project:
 
     zig build run
+
+The project uses Zig 0.10.1.
