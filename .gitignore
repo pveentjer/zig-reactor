@@ -1,5 +1,5 @@
 zig-cache/
 zig-out/
 build-zig
-zig-example.s
+zig-reactor.s
 .idea/

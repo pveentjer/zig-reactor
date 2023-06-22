@@ -75,8 +75,6 @@ pub const Socket = struct {
     pub fn init(config: SocketConfig) !*Socket {
         var self = try config.allocator.create(Socket);
         
-        // const socket = try os.socket(address.any.family, os.SOCK.STREAM , 0);
-  
         if (config.fd) |fd| {
             self.fd = fd;
         } else {
@@ -125,10 +123,9 @@ pub const Socket = struct {
         }
 
         if (res < 0) {
-            // return os.unexpectedErrno(linux.getErrno(@intCast(usize, -res)));
-
-            std.debug.print("Failed to connect to socket res: {}\n", .{util.errno(res)});
-            return;
+            const e =  util.errno(res);
+            std.debug.print("Failed tp cpmmect socket. errno {} ", .{e});
+            return os.unexpectedErrno(e);
         }
 
         var connect_handler = self.connect_handler orelse unreachable;  
@@ -191,7 +188,7 @@ pub const Socket = struct {
 
         if (res >= 0) {
             if (res == 0){
-                std.debug.print("{s} close socket due to EOF\n", .{});
+                std.debug.print("{s} close socket due to EOF\n", .{self.reactor.name});
                 self.close();
             }
 
