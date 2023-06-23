@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const Ordering = std.atomic.Ordering;
 const os = std.os;
 const linux = std.os.linux;
+const io_uring_params = linux.io_uring_params;
 const IO_Uring = linux.IO_Uring;
 const ReadBuffer = IO_Uring.ReadBuffer;
 const AtomicCircularQueue = @import("atomic_circular_queue.zig").AtomicCircularQueue;
@@ -12,10 +13,8 @@ const util = @import("util.zig");
 const RunQueue = AtomicCircularQueue(*ReactorTask);
 const SocketQueue = CircularQueue(*Socket);
 const Atomic_bool = std.atomic.Atomic(bool);
-
 const c = @cImport({
     @cInclude("sys/eventfd.h");
-    @cDefine("_GNU_SOURCE", {});
     @cInclude("sched.h");
 });
 
@@ -40,6 +39,7 @@ pub const ReactorConfig = struct {
     run_queue_cap: u32 = 1024,
     io_uring_entries: u13 = 1024,
     delay_ns: u64 = 0,
+    io_uring_params: ?io_uring_params = null,
     cpu_set: ?c.cpu_set_t = null,
     spin: bool = false,
 };
@@ -59,7 +59,7 @@ pub const Reactor = struct {
     cpu_set: ?c.cpu_set_t,
     spin: bool,
 
-    pub fn init(config: ReactorConfig) !*Reactor {
+    pub fn init(config: *ReactorConfig) !*Reactor {
         const res: c_int = c.eventfd(0, 0);
         if (res < 0) {
             return os.unexpectedErrno(util.errno(res));
@@ -69,7 +69,11 @@ pub const Reactor = struct {
         self.round = 0;
         self.run_queue = try RunQueue.init(config.run_queue_cap, config.allocator);
         self.name = config.name;
-        self.uring = try IO_Uring.init(config.io_uring_entries, 0);
+        if (config.io_uring_params) |*params| {
+            self.uring = try IO_Uring.init_params(config.io_uring_entries, params);
+        } else { 
+            self.uring = try IO_Uring.init(config.io_uring_entries, 0);
+        }
         self.stop = Atomic_bool.init(false);
         self.eventfd = res;
         self.eventfd_handler = CompletionHandler{ .handle = eventfd_handle };

@@ -15,6 +15,10 @@ pub fn CircularQueue(comptime T: type) type {
         allocator: Allocator,
 
         pub fn init(cap: usize, allocator: Allocator) !Self {
+            if (!std.math.isPowerOfTwo(cap)) {
+                return error.EntriesNotPowerOfTwo;
+            }
+            
             // todo: cap should be power of 2
             return Self{
                 .items = try allocator.alloc(T, cap),

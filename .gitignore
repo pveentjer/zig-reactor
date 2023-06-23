@@ -3,3 +3,4 @@ zig-out/
 build-zig
 zig-echo.s
 .idea/
+src/zig-reactor.code-workspace

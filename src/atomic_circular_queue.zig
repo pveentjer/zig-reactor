@@ -16,7 +16,10 @@ pub fn AtomicCircularQueue(comptime T: type) type {
         mutex: std.Thread.Mutex,
 
         pub fn init(cap: usize, allocator: Allocator) !Self {
-            // todo: cap should be power of 2
+            if (!std.math.isPowerOfTwo(cap)) {
+                return error.EntriesNotPowerOfTwo;
+            }
+            
             return Self{
                 .items = try allocator.alloc(T, cap),
                 .cap = cap,
