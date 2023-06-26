@@ -15,6 +15,7 @@ const SocketQueue = CircularQueue(*Socket);
 const Atomic_bool = std.atomic.Atomic(bool);
 const c = @cImport({
     @cInclude("sys/eventfd.h");
+    @cDefine("_GNU_SOURCE", {});
     @cInclude("sched.h");
 });
 
@@ -46,7 +47,6 @@ pub const ReactorConfig = struct {
 
 pub const Reactor = struct {
     stop: std.atomic.Atomic(bool),
-    round: u64,
     thread: std.Thread = undefined,
     name: []const u8 = undefined,
     run_queue: RunQueue,
@@ -66,7 +66,6 @@ pub const Reactor = struct {
         }
 
         var self = try config.allocator.create(Reactor);
-        self.round = 0;
         self.run_queue = try RunQueue.init(config.run_queue_cap, config.allocator);
         self.name = config.name;
         if (config.io_uring_params) |*params| {
@@ -78,7 +77,6 @@ pub const Reactor = struct {
         self.eventfd = res;
         self.eventfd_handler = CompletionHandler{ .handle = eventfd_handle };
         self.debug = config.debug;
-        self.round = 0;
         self.delay_ns = config.delay_ns;
         self.cpu_set = config.cpu_set;
         self.spin = config.spin;
@@ -148,7 +146,6 @@ pub const Reactor = struct {
         try self.readEventFd();
 
         while (!stop.load(Ordering.Monotonic)) {
-            //std.debug.print("{s} round {}\n", .{ self.name, self.round });
             if (self.delay_ns > 0) {
                 std.time.sleep(self.delay_ns);
             }
@@ -157,8 +154,6 @@ pub const Reactor = struct {
                 try uring.submit()
             else
                 try uring.submit_and_wait(1);
-
-            // todo: improve error handling
 
             if (self.debug) {
                 std.debug.print("{s} submited res {!}\n", .{ self.name, submit_res });
@@ -187,8 +182,6 @@ pub const Reactor = struct {
                     std.debug.print("task {} ran into an error {!}\n", .{ task, err });
                 };
             }
-
-            self.round += 1;
         }
     }
 
