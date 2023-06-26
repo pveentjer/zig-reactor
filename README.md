@@ -13,7 +13,6 @@ Or with full optimizations:
     zig build -Drelease-fast=true run
 
 There are many things that need to be done:
-- Multiple sockets connections
 - Concurrent payloads from a single connection
 - Configurable payload size
 - Improved error handling

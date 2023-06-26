@@ -341,7 +341,7 @@ pub fn main() !void {
 
     try server_sock.setBlocking(false);
     // Receive buffer size needs to be set on the server socket for window scaling to work
-    try server_sock.setReceiveBufferSize(16384);
+    try server_sock.setReceiveBufferSize(receiveBufferSize);
 
     var start_accept_task = try StartAcceptTask.init(global_allocator, server_sock);
     _ = server_reactor.offer(&start_accept_task.task_iface);
