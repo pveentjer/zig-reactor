@@ -29,17 +29,18 @@ const BufferPool = CircularQueue([]u8);
 
 
 // The benchmark properties.
-const duration_s: u64 = 60;
+const duration_s: u64 = 1260;
 const tcp_no_delay: bool = true;
 // not implemented yet.
 const payload_size: u32 = 0;
-const connections: u16 = 100;
-
+const connections: u16 = 1;
+const sendBufferSize: usize = 256 * 1024;
+const receiveBufferSize: usize = 256 * 1024;
 
 var stop = Atomic_bool.init(false);
 var started = Semaphore{ .permits = 0 };
 
-pub const StartAcceptTask = struct {
+const StartAcceptTask = struct {
     task_iface: ReactorTask,
     accept_handler_iface: CompletionHandler,
     server_socket: *Socket,
@@ -67,21 +68,23 @@ pub const StartAcceptTask = struct {
 
         if (res < 0) {
             const e =  util.errno(res);
-            std.debug.print("Failed to accept, failed with errno {} ", .{e});
+            std.debug.print("server: Failed to accept, failed with errno {} ", .{e});
             return os.unexpectedErrno(e);
         }
 
-        std.debug.print("Accepted socket with fd {}\n", .{res});
+        std.debug.print("server: Accepted socket with fd {}\n", .{res});
 
         var socket = try Socket.init(SocketConfig{
-            .allocator=self.allocator,
-            .reactor=self.server_socket.reactor,
-            .ipv4=true,
-            .fd=res,
+            .allocator = self.allocator,
+            .reactor = self.server_socket.reactor,
+            .ipv4 = true,
+            .fd = res,
         });
     
         try socket.setTcpNoDelay(tcp_no_delay);
         try socket.setBlocking(false);
+        try socket.setSendBufferSize(sendBufferSize);
+        try socket.setReceiveBufferSize(receiveBufferSize);
 
         var socket_handler = try ServerSocketHandler.init(self.allocator, socket);
         try socket_handler.start();
@@ -91,7 +94,7 @@ pub const StartAcceptTask = struct {
     }
 };
 
-pub const ServerSocketHandler = struct {
+const ServerSocketHandler = struct {
     write_complete_iface: WriteCompleteHandler,
     read_complete_iface: ReadCompleteHandler,
     socket: *Socket,
@@ -103,7 +106,7 @@ pub const ServerSocketHandler = struct {
         var self = try allocator.create(ServerSocketHandler);
         self.write_complete_iface = WriteCompleteHandler{ .onComplete = write_complete };
         self.read_complete_iface = ReadCompleteHandler{ .onComplete = read_complete };
-        self.buffer_pool = try BufferPool.init(128,allocator);
+        self.buffer_pool = try BufferPool.init(128, allocator);
         self.socket = socket;
         self.iteration = 0;
         self.allocator = allocator;
@@ -122,7 +125,7 @@ pub const ServerSocketHandler = struct {
         var buf = try self.get_buffer();
         try self.socket.read(buf, &self.read_complete_iface);
         
-        std.debug.print("ServerSocketHandler started\n",.{});
+        std.debug.print("server: ServerSocketHandler started\n",.{});
     }
 
     fn write_complete(iface: *WriteCompleteHandler, buf:[]u8) !void {
@@ -150,13 +153,13 @@ pub const ServerSocketHandler = struct {
             try self.socket.write(buf, @intCast(usize, res), &self.write_complete_iface);
         } else {
             const e =  util.errno(res);
-            std.debug.print("server socket.read failed with errno {}\n", .{e});
+            std.debug.print("server: socket.read failed with errno {}\n", .{e});
             return os.unexpectedErrno(e);
         }
     }
 };
 
-pub const StartClientTask = struct {
+const StartClientTask = struct {
     task_iface: ReactorTask,
     connect_handler_iface: ConnectHandler,
     socket: *Socket,
@@ -182,19 +185,19 @@ pub const StartClientTask = struct {
 
         if (res >= 0) {
             started.post();
-            std.debug.print("Socket.connect completed\n", .{ });
+            std.debug.print("client: socket connect completed, fd={}\n", .{self.socket.fd});
 
             var handler = try ClientSocketHandler.init(global_allocator, self.socket) ; 
             try handler.start();
         } else {
             const e =  util.errno(res);
-            std.debug.print("server socket connect failed with errno {}\n", .{e});
+            std.debug.print("client: socket connect failed with errno {}\n", .{e});
             return os.unexpectedErrno(e);
         }
     }
 };
 
-pub const ClientSocketHandler = struct {
+const ClientSocketHandler = struct {
     write_complete_iface: WriteCompleteHandler,
     read_complete_iface: ReadCompleteHandler,
     socket: *Socket,
@@ -208,7 +211,7 @@ pub const ClientSocketHandler = struct {
         self.read_complete_iface = ReadCompleteHandler{ .onComplete = read_complete };
         self.socket = socket;
         self.iteration = 0;
-        self.buffer_pool = try BufferPool.init(128,allocator);
+        self.buffer_pool = try BufferPool.init(128, allocator);
         self.allocator = allocator;
         return self;
     }
@@ -230,14 +233,14 @@ pub const ClientSocketHandler = struct {
             // is in the buffer is good enough.
             //std.mem.writeIntLittle(u32, buf, payloadSize);
             
-            try self.socket.write(buf, @sizeOf(u32)+payload_size, &self.write_complete_iface);
+            try self.socket.write(buf, @sizeOf(u32) + payload_size, &self.write_complete_iface);
             i += 1;
         }
 
         var next_read_buf = try self.get_buffer();
         try self.socket.read(next_read_buf, &self.read_complete_iface);
 
-        std.debug.print("Client SocketHandler started.\n",.{});
+        std.debug.print("client: Client SocketHandler started.\n",.{});
     }
 
     fn write_complete(iface: *WriteCompleteHandler, buf:[]u8) !void {
@@ -268,7 +271,7 @@ pub const ClientSocketHandler = struct {
             try self.socket.write(buf, @intCast(usize, res), &self.write_complete_iface);
         } else{
             const e =  util.errno(res);
-            std.debug.print("client socket.read failed with errno {} ", .{e});
+            std.debug.print("client: socket.read failed with errno {} ", .{e});
             return os.unexpectedErrno(e);
         }
     }
@@ -296,7 +299,7 @@ pub fn main() !void {
         break :blk seed;
     });
     const rand = prng.random();
-    const port: u16 = 5000 + @mod(rand.int(u16), 200);
+    const port: u16 = 5_000 + @mod(rand.int(u16), 200);
     
     const addr = try Address.parseIp4("127.0.0.1",  port);
  
@@ -306,6 +309,7 @@ pub fn main() !void {
             .flags = 0,
             .sq_thread_idle = 1000,
     });
+
     var server_reactor_config:ReactorConfig = ReactorConfig{
         .name = "server-reactor",
         .allocator = global_allocator,
@@ -314,7 +318,7 @@ pub fn main() !void {
         .run_queue_cap = 64 * 1024,
         .io_uring_entries = 4096,
         .io_uring_params = server_io_uring_params,
-        // .delay_ns = 1000,
+        .delay_ns = 0,
     };
     var server_reactor = try Reactor.init(&server_reactor_config);
     try server_reactor.start();
@@ -327,15 +331,17 @@ pub fn main() !void {
     });
     defer server_sock.close();
 
-    std.debug.print("server_sock fd {}\n", .{server_sock.fd});
+    std.debug.print("server: Server socket.fd={}\n", .{server_sock.fd});
 
     try server_sock.bind(addr);
-    std.debug.print("server socket bind\n", .{});
+    std.debug.print("server: Server socket bind\n", .{});
 
     try server_sock.listen(10);
-    std.debug.print("server socket listen\n", .{});
+    std.debug.print("server: Server socket listen\n", .{});
 
     try server_sock.setBlocking(false);
+    // Receive buffer size needs to be set on the server socket for window scaling to work
+    try server_sock.setReceiveBufferSize(16384);
 
     var start_accept_task = try StartAcceptTask.init(global_allocator, server_sock);
     _ = server_reactor.offer(&start_accept_task.task_iface);
@@ -355,7 +361,6 @@ pub fn main() !void {
     try client_reactor.start();
     defer client_reactor.shutdown();
 
-   
     var i: u32=0;
     while (i < connections) {
         var client_sock = try Socket.init(SocketConfig{
@@ -367,6 +372,8 @@ pub fn main() !void {
         //defer client_sock.close();
         try client_sock.setTcpNoDelay(tcp_no_delay);
         try client_sock.setBlocking(false);
+        try client_sock.setSendBufferSize(sendBufferSize);
+        try client_sock.setReceiveBufferSize(receiveBufferSize);
 
         var task = try StartClientTask.init(global_allocator, client_sock, addr);
         _ = client_reactor.offer(&task.task_iface);
@@ -390,11 +397,11 @@ pub fn main() !void {
     try server_reactor.join();
     try client_reactor.join();
 
-    const operations = counter.load(Ordering.Monotonic);
-    const thp = @divFloor(operations,duration_s);
+    const cnt = counter.load(Ordering.Monotonic);
+    const thp = @divFloor(cnt, duration_s);
 
     std.debug.print("Payload size {}.\n",.{payload_size});
     std.debug.print("Duration {} s.\n",.{duration_s});
-    std.debug.print("Operations {}.\n",.{operations});
-    std.debug.print("Echo {}/s.\n",.{thp});
+    std.debug.print("Operations {}.\n",.{cnt});
+    std.debug.print("Throughput {}/s.\n",.{thp});
 }

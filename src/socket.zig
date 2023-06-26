@@ -32,7 +32,16 @@ const c = @cImport({
     @cInclude("netinet/ip.h");
 });
 
-const WriteEntry = struct { buf: []u8, len: usize, handler: *WriteCompleteHandler };
+const WriteEntry = struct { 
+    // the buffer to write.
+    buf: []u8, 
+    // number of bytes to write
+    len: usize, 
+    // the offset within the buf to start from
+    offset:usize, 
+    // the handler to call on completion of the write.
+    handler: *WriteCompleteHandler 
+};
 
 const WriteQueue = CircularQueue(WriteEntry);
 
@@ -58,7 +67,9 @@ pub const SocketConfig = struct {
 pub const Socket = struct {
     fd: i32,
     reactor: *Reactor,
+    // Contains the write_entries that are currently being send to the socket.
     pending_queue: WriteQueue,
+    // Contains the write_entries that need to be send to the socket.
     write_queue: WriteQueue,
     write_completed_iface: CompletionHandler,
     read_completed_iface: CompletionHandler,
@@ -79,7 +90,7 @@ pub const Socket = struct {
             self.fd = fd;
         } else {
             const domain: c_int = if (config.ipv4) c.AF_INET else c.AF_INET6;
-            const res = c.socket(domain, c.SOCK_STREAM, 0);
+            const res: c_int = c.socket(domain, c.SOCK_STREAM, 0);
             if (res < 0) {
                 return os.unexpectedErrno(util.errno(res));
             }
@@ -101,7 +112,6 @@ pub const Socket = struct {
         return self;
     }
 
-    // todo: Should be non blocking
     pub fn connect(self: *Socket, addr: *Address, handler:*ConnectHandler) !void {
         if (self.reactor.debug) {
             std.debug.print("connect to {}\n", .{ addr });
@@ -148,7 +158,7 @@ pub const Socket = struct {
     }
 
     pub fn listen(self: *Socket, backlog: u16) !void {
-        const res = c.listen(self.fd, backlog);
+        const res: c_int = c.listen(self.fd, backlog);
 
         if (res < 0) {
             return os.unexpectedErrno(util.errno(res));
@@ -208,7 +218,12 @@ pub const Socket = struct {
             std.debug.print("{s} write len {}\n", .{self.reactor.name, len});
         }
 
-        const write_entry = WriteEntry{ .buf = buf, .len = len, .handler = handler };
+        const write_entry = WriteEntry{ 
+            .buf = buf, 
+            .len = len, 
+            .offset = 0, 
+            .handler = handler 
+        };
         
         if (!self.write_queue.offer(write_entry)) {
             return error.oops;
@@ -227,7 +242,8 @@ pub const Socket = struct {
         var self = @fieldParentPtr(Socket, "write_schedule_iface", iface);
 
         if (self.reactor.debug) {
-            std.debug.print("{s} socket handleWriteStart writeQueue.len={}, pendingQueue.len={}\n", .{ self.reactor.name, self.write_queue.len, self.pending_queue.len });
+            std.debug.print("{s} socket handleWriteStart writeQueue.len={}, pendingQueue.len={}\n", 
+                .{ self.reactor.name, self.write_queue.len, self.pending_queue.len });
         }
 
         var drain_count = self.write_queue.drainTo(&self.pending_queue);
@@ -235,27 +251,39 @@ pub const Socket = struct {
             std.debug.print("{s} socket drain_count {}\n", .{ self.reactor.name, drain_count });
         }
 
-        const len = self.pending_queue.len;
-        if (len == 0) {
-            return;
-        } else if (len == 1) {
-            var entry = self.pending_queue.items[self.pending_queue.head & self.pending_queue.mask];
-            const user_data: u64 = @ptrToInt(&self.write_completed_iface);
+        switch(self.pending_queue.len){
+            0 => {
+                // There is nothing to write, so we are done.
+                return;
+            },
+            1 => {
+                // There is a single item to write.
 
-            // send is faster than write.
-            _ = try self.reactor.uring.send(user_data, self.fd, entry.buf.ptr[0..entry.len], 0);
-        } else {
-            // https://nmichaels.org/zig/pointers.html
-            var i: u16 = 0;
-            while (i < len and i < self.io_vec.len) {
-                var write_entry = self.pending_queue.items[(self.pending_queue.head + i) & self.pending_queue.mask];
-                self.io_vec[i] = .{ .iov_base = write_entry.buf.ptr, .iov_len = write_entry.len };
-                i += 1;
-            }
-            const user_data: u64 = @ptrToInt(&self.write_completed_iface);
+                var write_entry = self.pending_queue.items[self.pending_queue.head & self.pending_queue.mask];
+                const user_data: u64 = @ptrToInt(&self.write_completed_iface);
 
-            const v = self.io_vec[0..len];
-            _ = try self.reactor.uring.writev(user_data, self.fd, v, 0);
+                var buffer = write_entry.buf.ptr[write_entry.offset..write_entry.offset + write_entry.len];
+                // we use send because it is faster than write.
+                _ = try self.reactor.uring.send(user_data, self.fd, buffer, 0);    
+            },
+            else => |pending_queue_len| {
+                // There is a batch of items to write, so we use vectorized I/O.
+
+                // https://nmichaels.org/zig/pointers.html
+                var i: u16 = 0;
+                const iovcnt = @min(pending_queue_len, self.io_vec.len);
+                while (i < iovcnt) {
+                    var write_entry = self.pending_queue.items[(self.pending_queue.head + i) & self.pending_queue.mask];
+                    self.io_vec[i] = .{ 
+                        .iov_base = write_entry.buf.ptr + write_entry.offset, 
+                        .iov_len = write_entry.len 
+                    };
+                    i += 1;
+                }
+
+                const user_data: u64 = @ptrToInt(&self.write_completed_iface);
+                _ = try self.reactor.uring.writev(user_data, self.fd,  self.io_vec[0..iovcnt], 0);
+            },
         }
     }
 
@@ -272,42 +300,42 @@ pub const Socket = struct {
         }
 
         self.bytes_written += @intCast(u64, res);
-        var remaining = @intCast(usize, res);
+        var bytes_remaining: usize = @intCast(usize, res);
         //std.debug.print("pending_queue.len {}\n", .{pending_queue.len});
 
         assert(self.pending_queue.len > 0);
 
-        var completed: u16 = 0;
-        while (self.pending_queue.len > 0 and remaining > 0) {
+        var completed_cnt: u16 = 0;
+        while (self.pending_queue.len > 0 and bytes_remaining > 0) {
             const index = self.pending_queue.head & self.pending_queue.mask;
             var write_entry = &self.pending_queue.items[index];
 
-            if (write_entry.len <= remaining) {
+            if (write_entry.len <= bytes_remaining) {
                 //std.debug.print("Packet fully written\n", .{});
                 // packet has been fully written
                 // todo: no need to pass res/flags
                 try write_entry.handler.onComplete(write_entry.handler, write_entry.buf);
                 // ditch the item
                 _ = self.pending_queue.poll();
-                remaining -= write_entry.len;
-                completed += 1;
+                bytes_remaining -= write_entry.len;
+                completed_cnt += 1;
             } else {
-                assert(false);
+                // item hasn't been fully written
 
                 std.debug.print("Packet not fully written\n", .{});
-                // item hasn't been fully written
-                // todo: we need to update this buffer; offset + length is no good
+                write_entry.offset +=bytes_remaining;
+                write_entry.len -= bytes_remaining;
                 break;
             }
         }
 
-        //std.debug.print("Completed writes in 1 go {}\n", .{completed});
+        //std.debug.print("completed_cnt writes in 1 go {}\n", .{completed_cnt});
 
-        if (self.write_queue.len > 0 or remaining > 0) {
+        if (self.write_queue.len > 0 or bytes_remaining > 0) {
             // The write queue isn't empty, so we need to do more writing
             try handleWriteStart(&self.write_schedule_iface);
         } else {
-            // Everything has been written, we are done
+            // Everything has been written, so we are done
             self.write_scheduled = false;
         }
     }
@@ -323,7 +351,7 @@ pub const Socket = struct {
         var addr: linux.sockaddr = undefined;
         var addr_len = @intCast(linux.socklen_t, @sizeOf(*linux.socklen_t));
 
-        var res = linux.getsockname(self.fd, &addr, &addr_len);
+        var res: c_int = linux.getsockname(self.fd, &addr, &addr_len);
         if (res != 0) {
             return os.unexpectedErrno(util.errno(res));
         }
@@ -346,7 +374,7 @@ pub const Socket = struct {
         var addr: linux.sockaddr = undefined;
         var addr_len = @intCast(linux.socklen_t, @sizeOf(*linux.socklen_t));
 
-        var res = linux.getpeername(self.fd, &addr, &addr_len);
+        var res: c_int = linux.getpeername(self.fd, &addr, &addr_len);
         if (res != 0) {
             return os.unexpectedErrno(util.errno(res));
         }
@@ -355,26 +383,64 @@ pub const Socket = struct {
     }
 
     pub fn setTcpNoDelay(self: *Socket, tcpNoDelay: bool) !void {
-        const value: c_int = if (tcpNoDelay) 1 else 0;
+        const val: c_int = if (tcpNoDelay) 1 else 0;
 
-        const res = c.setsockopt(self.fd, c.SOL_TCP, c.TCP_NODELAY, &value, @sizeOf(c_int));
+        const res: c_int = c.setsockopt(self.fd, c.SOL_TCP, c.TCP_NODELAY, &val, @sizeOf(c_int));
         if (res == -1) {
             return os.unexpectedErrno(util.errno(res));
         }
     }
 
     pub fn setBlocking(self: *Socket, block: bool) !void {
-        // todo: fix name
-        const foo: u8 = 0;
-        const flags = c.fcntl(self.fd, c.F_GETFL, foo);
+        const arg: u8 = 0;
+        const flags:c_int = c.fcntl(self.fd, c.F_GETFL, arg);
         if (flags == -1) {
             return os.unexpectedErrno(util.errno(flags));
         }
 
         const new_flags = if (block) flags & ~c.O_NONBLOCK else flags | c.O_NONBLOCK;
-        const res = c.fcntl(self.fd, c.F_SETFL, new_flags);
+        const res: c_int = c.fcntl(self.fd, c.F_SETFL, new_flags);
         if (res == -1) {
             return os.unexpectedErrno(errno(res));
         }
     }
+    
+    pub fn setReceiveBufferSize(self: *Socket, size: usize) !void {
+        return setBufferSize(self, c.SO_RCVBUF, size);
+    }
+    
+    pub fn getReceiveBufferSize(self: *Socket) !usize {
+        return getBufferSize(self, c.SO_RCVBUF);       
+    }
+
+    pub fn setSendBufferSize(self: *Socket, size: usize) !void {
+        return setBufferSize(self, c.SO_SNDBUF, size);
+    }
+
+    pub fn getSendBufferSize(self: *Socket) !usize {
+        return getBufferSize(self, c.SO_SNDBUF);
+    }
+
+    fn setBufferSize(self: *Socket, option_name: c_int, size: usize) !void {
+        const option_val: c_int = @intCast(c_int, size);
+        const option_len: c_int = @sizeOf(c_int);
+
+        const res: c_int = c.setsockopt(self.fd, c.SOL_SOCKET, option_name, &option_val, option_len);
+        if (res == -1) {
+            return os.unexpectedErrno(util.errno(res));
+        }
+    }
+
+    fn getBufferSize(self: *Socket, option_name: c_int) !usize {
+        var option_val: c_int = undefined;
+        var option_len: c_uint = @sizeOf(c_int);
+
+        const res: c_int = c.getsockopt(self.fd, c.SOL_SOCKET, option_name, &option_val, &option_len);
+        if (res == -1) {
+            return os.unexpectedErrno(util.errno(res));
+        }
+
+        return @intCast(usize, option_val);
+    }
+
 };
